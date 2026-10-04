@@ -6,6 +6,7 @@ class AvailableDevice(TypedDict):
     name: str
     serialnum: str
     error:str | None
+    connected: bool
 
 class OscillsocopeStatus(TypedDict):
     ready: bool

@@ -8,7 +8,7 @@
 """
 
 
-from ctypes import *
+from ctypes import c_int,c_ubyte,c_double
 
 # device handle
 #HDWF

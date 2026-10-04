@@ -1,17 +1,10 @@
-from ctypes import byref, c_double, c_int, cdll, create_string_buffer
+from ctypes import byref, c_double, c_int, cdll, create_string_buffer, c_byte, sizeof
 from .dwfconstants import *
-import csv
-from datetime import datetime
-import math
-from pathlib import Path
 import time
-import matplotlib.pyplot as plt
 import sys
-import numpy
-from PySide6.QtCore import QStandardPaths
 from .types import AvailableDevice, OscillsocopeStatus
+from collections.abc import Callable, Sequence
 from typing import Literal
-from .signals import generate_pulse
 
 class DigilentApi():
     def __init__(self) :
@@ -23,6 +16,7 @@ class DigilentApi():
         else:
             self.dwf = cdll.LoadLibrary("libdwf.so")
         self.hdwf = c_int()
+        self.connected_device_serial: str | None = None
 
         self.oscilloscope_mode = None
         self.measuredSamples = None
@@ -30,7 +24,8 @@ class DigilentApi():
         self.nSamples = 0
         self.analogMeasurementChannel = None
         self.analogReferenceChannel = None
-        
+        self.frequencyAcquire=None
+
     def _get_error(self):
         "Returns digilent waveforms sdk error"
         szerr = create_string_buffer(512)
@@ -67,43 +62,79 @@ class DigilentApi():
         for iDevice in range(0, cDevice.value):
             self.dwf.FDwfEnumDeviceName(c_int(iDevice), devicename)
             self.dwf.FDwfEnumSN(c_int(iDevice), serialnum)
+            device_serial = serialnum.value.decode("utf-8", errors="replace")
             print(serialnum.value)
             
             print("------------------------------")
             print("Device "+str(iDevice+1)+" : ")
             print("\t" + devicename.value.decode("utf-8", errors="replace"))
             print("\t" + serialnum.value.decode("utf-8", errors="replace"))
-            self.dwf.FDwfDeviceOpen(c_int(iDevice), byref(self.hdwf))
-            if self.hdwf.value == 0:
+            if (
+                self.hdwf.value != hdwfNone.value
+                and self.connected_device_serial == device_serial
+            ):
+                number_of_channels = c_int()
+                if self.dwf.FDwfAnalogInChannelCount(
+                    self.hdwf, byref(number_of_channels)
+                ):
+                    available_devices.append({
+                        "idx": iDevice,
+                        "name": devicename.value.decode("utf-8", errors="replace"),
+                        "serialnum": device_serial,
+                        "error": None,
+                        "connected": True,
+                    })
+                    continue
+
+                self.dwf.FDwfDeviceClose(self.hdwf)
+                self.hdwf = c_int()
+                self.connected_device_serial = None
+
+            probe_handle = c_int()
+            self.dwf.FDwfDeviceOpen(c_int(iDevice), byref(probe_handle))
+            if probe_handle.value == hdwfNone.value:
                 szerr = create_string_buffer(512)
                 self.dwf.FDwfGetLastErrorMsg(szerr)
                 print(szerr.value.decode("utf-8", errors="replace"))
                 available_devices.append({
                         "idx": iDevice,
                         "name": devicename.value.decode("utf-8", errors="replace"),
-                        "serialnum": serialnum.value.decode("utf-8", errors="replace"),
-                        "error": szerr.value.decode("utf-8", errors="replace")
+                        "serialnum": device_serial,
+                        "error": szerr.value.decode("utf-8", errors="replace"),
+                        "connected": False,
                 })
             else:
                 available_devices.append({
                         "idx": iDevice,
                         "name": devicename.value.decode("utf-8", errors="replace"),
-                        "serialnum": serialnum.value.decode("utf-8", errors="replace"),
-                        "error":None
+                        "serialnum": device_serial,
+                        "error":None,
+                        "connected": False,
                         })
-            self.dwf.FDwfDeviceClose(self.hdwf)
+                self.dwf.FDwfDeviceClose(probe_handle)
                 
         return available_devices
 
     def connect_to_device(self,device_idx)->str|None:
         print(f"Connecting to device {device_idx}")
-
         connect_error=create_string_buffer(512)
-        self.connected_device_idx=device_idx
-        self.dwf.FDwfDeviceOpen(c_int(device_idx), byref(self.hdwf))
-        if self.hdwf.value == hdwfNone.value:
+        new_handle = c_int()
+        self.dwf.FDwfDeviceOpen(c_int(device_idx), byref(new_handle))
+        if new_handle.value == hdwfNone.value:
             self.dwf.FDwfGetLastErrorMsg(connect_error)
             return connect_error.value.decode("utf-8", errors="replace")
+
+        serialnum = create_string_buffer(16)
+        if not self.dwf.FDwfEnumSN(c_int(device_idx), serialnum):
+            self.dwf.FDwfDeviceClose(new_handle)
+            return self._get_error()
+
+        if self.hdwf.value != hdwfNone.value:
+            self.dwf.FDwfDeviceClose(self.hdwf)
+        self.hdwf = new_handle
+        self.connected_device_serial = serialnum.value.decode(
+            "utf-8", errors="replace"
+        )
 
         number_of_out_channels=c_int()
 
@@ -117,9 +148,31 @@ class DigilentApi():
         print(f"Analog in channels: {number_of_channels.value}")
         print("Connected Succesfully")
 
+    def get_channel_counts(self) -> tuple[int, int]:
+        if self.hdwf.value == hdwfNone.value:
+            raise RuntimeError("No device is connected")
+
+        analog_input_count = c_int()
+        analog_output_count = c_int()
+        self._require_dwf(
+            self.dwf.FDwfAnalogInChannelCount(
+                self.hdwf, byref(analog_input_count)
+            ),
+            "Reading the analog input channel count",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutCount(
+                self.hdwf, byref(analog_output_count)
+            ),
+            "Reading the analog output channel count",
+        )
+        return analog_input_count.value, analog_output_count.value
+
     def disconnect_from_device(self):
         print("Disconnecting from device")
         self.dwf.FDwfDeviceClose(self.hdwf)
+        self.hdwf=c_int()
+        self.connected_device_serial = None
         
     def configure_oscilloscope(
         self,
@@ -201,10 +254,7 @@ class DigilentApi():
         ):
             return {"ready": False, "message": self._get_error()}
 
-        if (
-            mode == "read"
-            and not minimum_buffer.value <= number_of_samples <= maximum_buffer.value
-        ):
+        if mode=="read" and not minimum_buffer.value <= number_of_samples <= maximum_buffer.value:
             return {
                 "ready": False,
                 "message": (
@@ -212,6 +262,9 @@ class DigilentApi():
                     f"between {minimum_buffer.value} and {maximum_buffer.value}."
                 ),
             }
+
+        if number_of_samples<=0:
+            return {"ready":False,"message":"Number of samples must be greater than 0."}
 
         filtering_options = {
             "filterDecimate": filterDecimate,
@@ -257,6 +310,13 @@ class DigilentApi():
             self.dwf.FDwfDeviceAutoConfigureSet(self.hdwf, c_int(0)),
             "Disabling automatic configuration",
         )
+        for channel in range(number_of_channels.value):
+            self._require_dwf(
+                self.dwf.FDwfAnalogInChannelEnableSet(
+                    self.hdwf, c_int(channel), c_int(0)
+                ),
+                f"Disabling analog input channel {channel}",
+            )
         self._require_dwf(
             self.dwf.FDwfAnalogInFrequencySet(self.hdwf, c_double(sample_rate)),
             "Setting the analog input frequency",
@@ -272,14 +332,20 @@ class DigilentApi():
             reference_voltage_range,
             "reference",
         )
-
+        
+        
         if mode == "read":
             self._require_dwf(
-                self.dwf.FDwfAnalogInBufferSizeSet(
-                    self.hdwf, c_int(number_of_samples)
-                ),
-                "Setting the analog input buffer size",
-            )
+                            self.dwf.FDwfAnalogInAcquisitionModeSet(self.hdwf, acqmodeSingle),
+                            "Setting record acquisition mode",
+                        )
+            self._require_dwf(
+                                    self.dwf.FDwfAnalogInBufferSizeSet(
+                                        self.hdwf, c_int(number_of_samples)
+                                    ),
+                                    "Setting the analog input buffer size",
+                                )           
+
         else:
             self._require_dwf(
                 self.dwf.FDwfAnalogInAcquisitionModeSet(self.hdwf, acqmodeRecord),
@@ -303,26 +369,45 @@ class DigilentApi():
         self.measuredSamples = measured_samples
         self.referenceSamples = reference_samples
         self.nSamples = number_of_samples
-
+        # Set sample rate in memory
+        self.frequencyAcquire=sample_rate
         time.sleep(2)
         return {
             "ready": True,
             "message": f'The oscilloscope has been set to mode: "{mode.title()}".',
         }
 
-    def read_oscilloscope(self)->OscillsocopeStatus:
+    def read_oscilloscope(
+        self,
+        timeout_seconds: float | None = None,
+        on_acquisition_started: Callable[[], None] | None = None,
+    ) -> OscillsocopeStatus:
         sts = c_byte()
 
-        if self.oscilloscope_mode  not in ["read","record"] or self.measuredSamples is None or self.analogMeasurementChannel is None:
+        if self.oscilloscope_mode  not in ["read","record"] or self.measuredSamples is None or self.analogMeasurementChannel is None or self.referenceSamples is None or self.frequencyAcquire is None:
             return {"ready":False,"message":"Oscilloscope not configured yet"}
+
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            return {"ready": False, "message": "Timeout must be greater than 0 seconds."}
+
+        acquisition_duration = self.nSamples / self.frequencyAcquire
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else max(10.0, acquisition_duration * 1.5 + 1.0)
+        )
+        deadline = time.monotonic() + effective_timeout
 
         if self.oscilloscope_mode == "read":
             # Start the acquisition
+            if on_acquisition_started is not None:
+                on_acquisition_started()
+
             self._require_dwf(
                 self.dwf.FDwfAnalogInConfigure(self.hdwf, c_int(1), c_int(1)),
                 "Starting acquisition",
             )
-
+            
             # Wait for the acquisition to complete before reading the buffer.
             while True:
                 self._require_dwf(
@@ -331,22 +416,52 @@ class DigilentApi():
                 )
                 if sts.value == DwfStateDone.value :
                     break
+                if time.monotonic() >= deadline:
+                    self._require_dwf(
+                        self.dwf.FDwfAnalogInConfigure(
+                            self.hdwf, c_int(1), c_int(0)
+                        ),
+                        "Stopping timed-out acquisition",
+                    )
+                    return {
+                        "ready": False,
+                        "message": "Oscilloscope acquisition timed out.",
+                    }
                 time.sleep(0.1)
             print("Acquisition done")
 
             self._require_dwf(
-                self.dwf.FDwfAnalogInStatusData(self.hdwf, self.analogMeasurementChannel, self.measuredSamples, 4000),
-                "Reading analog input samples",
+                self.dwf.FDwfAnalogInStatusData(self.hdwf, self.analogMeasurementChannel, self.measuredSamples, self.nSamples),
+                "Reading analog measured samples",
             )
+
+            self._require_dwf(
+                            self.dwf.FDwfAnalogInStatusData(self.hdwf, self.analogReferenceChannel, self.referenceSamples, self.nSamples),
+                            "Reading analog reference samples",
+                        )
 
             return {"ready": True, "message": f"Oscilloscope data aqcuired"}
 
         else:
+            buffer_size = c_int()
+            self._require_dwf(
+                self.dwf.FDwfAnalogInBufferSizeGet(
+                    self.hdwf,
+                    byref(buffer_size),
+                ),
+                "Reading the configured analog input buffer size",
+            )
+
+            buffer_duration = buffer_size.value / self.frequencyAcquire
+            polling_interval = buffer_duration / 4
+
             print("Start Recorder")
             self._require_dwf(
                 self.dwf.FDwfAnalogInConfigure(self.hdwf, 0, 1),
                 "Starting record acquisition",
             )
+            if on_acquisition_started is not None:
+                on_acquisition_started()
             cSamples = 0
             cAvailable = c_int()
             cLost = c_int()
@@ -354,7 +469,22 @@ class DigilentApi():
             fLost = 0
             fCorrupted = 0
 
+            print(f"Polling interval: {polling_interval}")
             while cSamples < self.nSamples:
+                if time.monotonic() >= deadline:
+                    self._require_dwf(
+                        self.dwf.FDwfAnalogInConfigure(
+                            self.hdwf, c_int(1), c_int(0)
+                        ),
+                        "Stopping timed-out record acquisition",
+                    )
+                    return {
+                        "ready": False,
+                        "message": "Oscilloscope record acquisition timed out.",
+                    }
+                remaining_time = deadline - time.monotonic()
+                time.sleep(min(polling_interval, max(0.0, remaining_time)))
+                
                 self._require_dwf(
                     self.dwf.FDwfAnalogInStatus(self.hdwf, 1, byref(sts)),
                     "Reading acquisition status",
@@ -372,6 +502,8 @@ class DigilentApi():
                     fLost = 1
                 if cCorrupted.value :
                     fCorrupted = 1
+                if cSamples >= self.nSamples:
+                    break
                 if cAvailable.value==0 :
                     continue
                 if cSamples+cAvailable.value > self.nSamples :
@@ -388,6 +520,17 @@ class DigilentApi():
                     ),
                     "Reading recorded samples",
                 )
+
+                self._require_dwf(
+                    self.dwf.FDwfAnalogInStatusData(
+                        self.hdwf,
+                        self.analogReferenceChannel,
+                        byref(self.referenceSamples, sizeof(c_double)*cSamples),
+                        cAvailable,
+                    ),
+                    "Reading recorded samples",
+                )
+
                 cSamples += cAvailable.value
 
             warnings = []
@@ -403,41 +546,49 @@ class DigilentApi():
 
             return {"ready": True, "message": f"{message}"}
 
-    def generate_wave(self,out_channel:int,center_frequency:float,number_of_cycles:int,voltage_amplitude:float)->OscillsocopeStatus:
+    def prepare_wave(
+        self,
+        out_channel: int,
+        voltage: Sequence[float],
+        waveform_frequency: float,
+        voltage_amplitude: float,
+    ) -> OscillsocopeStatus:
 
         number_of_out_channels=c_int()
 
         if not self.dwf.FDwfAnalogOutCount(self.hdwf,byref(number_of_out_channels)):
             return {"ready":False,"message":self._get_error()}
 
-        if not 0<out_channel<(number_of_out_channels.value-1):
+        if not 0<=out_channel<=(number_of_out_channels.value-1):
             return {"ready":False,"message":f"Channel provided falls outside allowed range, pick a value between 0 and {number_of_out_channels.value-1}"}
+        if waveform_frequency <= 0:
+            return {"ready": False, "message": "Waveform frequency must be larger than 0"}
 
         channel = c_int(out_channel)
-        self.analogOutChannel = c_int(out_channel)
-        time,voltage=generate_pulse(center_frequency,number_of_cycles)
         AWG_Function = funcCustom
         points = len(voltage)
-        buffer = buffer = (c_double * points)(*[float(value) for value in voltage])
+        buffer = (c_double * points)(*[float(value) for value in voltage])
 
-        total_time=time[-1]-time[0]
+        total_time=1/waveform_frequency
         samplesMin=c_int()
-        samplesmax=c_double()
+        samplesmax=c_int()
 
         if not self.dwf.FDwfAnalogOutNodeDataInfo(self.hdwf,channel,AnalogOutNodeCarrier,byref(samplesMin),byref(samplesmax)):
             return {"ready":False,"message":self._get_error()}
 
-        if not samplesMin.value<= points<=samplesmax.value:
+        print()
+        if not samplesMin.value<= points <=samplesmax.value:
             suggestion = (
             "Increase frequency."
             if points < samplesMin.value
             else "Reduce frequency."
             )
 
+            print(f"Frequency cannot support the appropriate number of points. The points should be between {samplesMin.value} and {samplesmax.value}, where your config had {points}")
             return {
                 "ready": False,
                 "message": (
-                    "Frequency cannot support the appropriate number of points. "
+                    f"Frequency cannot support the appropriate number of points. The points should be between {samplesMin.value} and {samplesmax.value}, where your config had {points} "
                     f"{suggestion}"
                 ),}
 
@@ -448,7 +599,7 @@ class DigilentApi():
         if not self.dwf.FDwfAnalogOutNodeFrequencyInfo(self.hdwf,channel,AnalogOutNodeCarrier,byref(frequencyMin),byref(frequencyMax)):
              return {"ready":False,"message":self._get_error()}
 
-        if not frequencyMin.value<=center_frequency<=frequencyMax.value:
+        if not frequencyMin.value<=waveform_frequency<=frequencyMax.value or waveform_frequency<=0:
                     suggestion = (
                                 f"Increase frequency to above {frequencyMin.value} and below {frequencyMax.value}."
                                 if points < samplesMin.value
@@ -461,6 +612,7 @@ class DigilentApi():
                                 "Frequency cannot support the appropriate number of points. "
                                 f"{suggestion}"
                             ),}
+                
         # Check if runtime within allowed range
         minSeconds=c_double()
         maxSeconds=c_double()
@@ -487,31 +639,97 @@ class DigilentApi():
         
         print("Configure Wavegen")
         
-        self.dwf.FDwfAnalogOutNodeEnableSet(self.hdwf, channel, AnalogOutNodeCarrier, c_int(1))
-        # set function type
-        self.dwf.FDwfAnalogOutNodeFunctionSet(self.hdwf, channel, AnalogOutNodeCarrier, AWG_Function)
-        # Set data for custom function
-        self.dwf.FDwfAnalogOutNodeDataSet(self.hdwf, channel, AnalogOutNodeCarrier, buffer, points)
-        # set frequency
-        self.dwf.FDwfAnalogOutNodeFrequencySet(self.hdwf, channel, AnalogOutNodeCarrier, c_double(center_frequency))
-        # set amplitude
-        self.dwf.FDwfAnalogOutNodeAmplitudeSet(self.hdwf, channel, AnalogOutNodeCarrier, c_double(voltage_amplitude))
-        # set offset, always centered around 0
-        self.dwf.FDwfAnalogOutNodeOffsetSet(self.hdwf, channel, AnalogOutNodeCarrier, c_double(0))
-        # set symmetry to 50%
-        self.dwf.FDwfAnalogOutNodeSymmetrySet(self.hdwf, channel, AnalogOutNodeCarrier, c_double(50))
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeEnableSet(
+                self.hdwf, channel, AnalogOutNodeCarrier, c_int(1)
+            ),
+            "Enabling the analog output carrier",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeFunctionSet(
+                self.hdwf, channel, AnalogOutNodeCarrier, AWG_Function
+            ),
+            "Setting the analog output function",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeDataSet(
+                self.hdwf,
+                channel,
+                AnalogOutNodeCarrier,
+                buffer,
+                c_int(points),
+            ),
+            "Setting the custom analog output data",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeFrequencySet(
+                self.hdwf,
+                channel,
+                AnalogOutNodeCarrier,
+                c_double(waveform_frequency),
+            ),
+            "Setting the analog output frequency",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeAmplitudeSet(
+                self.hdwf,
+                channel,
+                AnalogOutNodeCarrier,
+                c_double(voltage_amplitude),
+            ),
+            "Setting the analog output amplitude",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeOffsetSet(
+                self.hdwf, channel, AnalogOutNodeCarrier, c_double(0)
+            ),
+            "Setting the analog output offset",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutNodeSymmetrySet(
+                self.hdwf, channel, AnalogOutNodeCarrier, c_double(50)
+            ),
+            "Setting the analog output symmetry",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutRunSet(
+                self.hdwf, channel, c_double(total_time)
+            ),
+            "Setting the analog output run time",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutWaitSet(
+                self.hdwf, channel, c_double(0)
+            ),
+            "Setting the analog output wait time",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutRepeatSet(
+                self.hdwf, channel, c_int(1)
+            ),
+            "Setting the analog output repeat count",
+        )
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutConfigure(
+                self.hdwf, channel, c_int(0)
+            ),
+            "Applying the analog output configuration",
+        )
 
-        # set running time limit
-        self.dwf.FDwfAnalogOutRunSet(self.hdwf, channel, c_double(total_time)) # one buffer
-        # set wait time before start
-        self.dwf.FDwfAnalogOutWaitSet(self.hdwf, channel, c_double(0))
-        # set number of repeating cycles
-        self.dwf.FDwfAnalogOutRepeatSet(self.hdwf, channel, 1)
-        # start
-        self.dwf.FDwfAnalogOutConfigure(self.hdwf, channel, c_bool(True))
+        self.analogOutChannel = channel
+        return {"ready": True, "message": "Signal prepared"}
 
-        while True:
-            sts=
+    def generate_wave(self) -> OscillsocopeStatus:
+        if not hasattr(self, "analogOutChannel"):
+            return {"ready": False, "message": "Signal not prepared yet"}
+
+        self._require_dwf(
+            self.dwf.FDwfAnalogOutConfigure(
+                self.hdwf, self.analogOutChannel, c_int(1)
+            ),
+            "Starting the analog output",
+        )
+        return {"ready": True, "message": "Signal started"}
     
             
 

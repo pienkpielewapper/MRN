@@ -113,7 +113,7 @@ class DigilentApi():
             connect_error=create_string_buffer(512)
             self.dwf.FDwfDeviceOpen(c_int(device_idx), byref(self.hdwf))
 
-            if self.hdwf.value == hdwfNone.value:
+            if self.hdwf.value == 0:
                 self.dwf.FDwfGetLastErrorMsg(connect_error)
                 return connect_error.value.decode("utf-8", errors="replace")
 

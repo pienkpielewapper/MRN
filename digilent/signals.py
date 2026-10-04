@@ -1,25 +1,31 @@
 import numpy as np
 from numpy import ndarray
 import matplotlib.pyplot as plt
+import time
+def generate_pulse(center_frequency: float,
+                   number_of_cycles: int) -> tuple[np.ndarray, np.ndarray, float]:
 
-def generate_pulse(center_frequency: float, number_of_cycles: int) -> tuple[np.ndarray, np.ndarray]:
-    # --- Pulse parameters ---
-    fc = center_frequency              # center frequency (10 MHz probe)
-    cycles = number_of_cycles          # number of cycles in the pulse
-    fs = fc*20             # sampling rate (500 MHz)
-    dt = 1/fs
+    fc = center_frequency
+    cycles = number_of_cycles
 
-    # --- Time vector ---
+    fs = fc * 20
+    dt = 1 / fs
+
     pulse_length = cycles / fc
-    t = np.arange(0, 4*pulse_length, dt)
 
-    # --- Gaussian envelope ---
-    sigma = pulse_length / number_of_cycles
-    envelope = np.exp(-((t - pulse_length)**2) / (2 * sigma**2))
+    # Centre the Gaussian in the waveform
+    t = np.arange(0, 2 * pulse_length, dt)
+    t0 = pulse_length
 
-    # --- Broadband pulse ---
+    # Gaussian envelope
+    sigma = pulse_length / 3
+    envelope = np.exp(-((t - t0) ** 2) / (2 * sigma ** 2))
+
+    # Carrier
     pulse = envelope * np.sin(2 * np.pi * fc * t)
 
-    return t, pulse
+    waveform_frequency = fs / len(t)
+
+    return t, pulse, waveform_frequency
 
     
