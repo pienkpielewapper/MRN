@@ -357,6 +357,7 @@ class DigilentApi():
                 ),
                 "Setting the record length",
             )
+            print(f"Record length: {number_of_samples / sample_rate}")
 
         self._require_dwf(
             self.dwf.FDwfAnalogInConfigure(self.hdwf, c_int(1), c_int(0)),
@@ -391,6 +392,8 @@ class DigilentApi():
             return {"ready": False, "message": "Timeout must be greater than 0 seconds."}
 
         acquisition_duration = self.nSamples / self.frequencyAcquire
+
+        print(f"Acquisition duration: {acquisition_duration}")
         effective_timeout = (
             timeout_seconds
             if timeout_seconds is not None
@@ -427,7 +430,7 @@ class DigilentApi():
                         "ready": False,
                         "message": "Oscilloscope acquisition timed out.",
                     }
-                time.sleep(0.1)
+                # time.sleep(0.1)
             print("Acquisition done")
 
             self._require_dwf(
@@ -453,7 +456,7 @@ class DigilentApi():
             )
 
             buffer_duration = buffer_size.value / self.frequencyAcquire
-            polling_interval = buffer_duration / 4
+            polling_interval = buffer_duration 
 
             print("Start Recorder")
             self._require_dwf(
@@ -462,6 +465,7 @@ class DigilentApi():
             )
             if on_acquisition_started is not None:
                 on_acquisition_started()
+
             cSamples = 0
             cAvailable = c_int()
             cLost = c_int()
@@ -483,34 +487,36 @@ class DigilentApi():
                         "message": "Oscilloscope record acquisition timed out.",
                     }
                 remaining_time = deadline - time.monotonic()
-                time.sleep(min(polling_interval, max(0.0, remaining_time)))
+                # time.sleep(min(polling_interval, max(0.0, remaining_time)))
                 
                 self._require_dwf(
                     self.dwf.FDwfAnalogInStatus(self.hdwf, 1, byref(sts)),
                     "Reading acquisition status",
                 )
+
                 if cSamples == 0 and (sts.value == DwfStateConfig.value or sts.value == DwfStatePrefill.value or sts.value == DwfStateArmed.value) :
                     # Acquisition not yet started.
+                    print("Acquisition not yet started")
                     continue
                 # check for lost samples or corrupt data
                 self._require_dwf(
                     self.dwf.FDwfAnalogInStatusRecord(self.hdwf, byref(cAvailable), byref(cLost), byref(cCorrupted)),
                     "Reading record status",
                 )
+                
                 cSamples += cLost.value
                 if cLost.value :
                     fLost = 1
                 if cCorrupted.value :
                     fCorrupted = 1
                 if cSamples >= self.nSamples:
+                    print("All samples acquired")
                     break
                 if cAvailable.value==0 :
                     continue
                 if cSamples+cAvailable.value > self.nSamples :
                     cAvailable.value = self.nSamples-cSamples
 
-                # Read the first input or Scope1
-                print(f"Writing buffer location {cSamples} of {self.nSamples}", end='\n')
                 self._require_dwf(
                     self.dwf.FDwfAnalogInStatusData(
                         self.hdwf,
@@ -576,7 +582,6 @@ class DigilentApi():
         if not self.dwf.FDwfAnalogOutNodeDataInfo(self.hdwf,channel,AnalogOutNodeCarrier,byref(samplesMin),byref(samplesmax)):
             return {"ready":False,"message":self._get_error()}
 
-        print()
         if not samplesMin.value<= points <=samplesmax.value:
             suggestion = (
             "Increase frequency."
