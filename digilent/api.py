@@ -382,7 +382,10 @@ class DigilentApi():
         self,
         timeout_seconds: float | None = None,
         on_acquisition_started: Callable[[], None] | None = None,
+        *,
+        trigger_output_channel: int | None = None,
     ) -> OscillsocopeStatus:
+        """Read a capture, optionally firing one pulse after the recorder is armed."""
         sts = c_byte()
 
         if self.oscilloscope_mode  not in ["read","record"] or self.measuredSamples is None or self.analogMeasurementChannel is None or self.referenceSamples is None or self.frequencyAcquire is None:
@@ -390,6 +393,43 @@ class DigilentApi():
 
         if timeout_seconds is not None and timeout_seconds <= 0:
             return {"ready": False, "message": "Timeout must be greater than 0 seconds."}
+
+        trigger_source = trigsrcNone
+        if trigger_output_channel is not None:
+            if self.oscilloscope_mode != "record":
+                return {
+                    "ready": False,
+                    "message": "Wavegen hardware triggering requires record mode.",
+                }
+            if on_acquisition_started is None:
+                return {
+                    "ready": False,
+                    "message": "Hardware-triggered recording requires a pulse callback.",
+                }
+            output_triggers = (
+                trigsrcAnalogOut1,
+                trigsrcAnalogOut2,
+                trigsrcAnalogOut3,
+                trigsrcAnalogOut4,
+            )
+            if not 0 <= trigger_output_channel < len(output_triggers):
+                return {
+                    "ready": False,
+                    "message": "Invalid waveform-generator trigger channel.",
+                }
+            trigger_source = output_triggers[trigger_output_channel]
+            supported_triggers = c_int()
+            self._require_dwf(
+                self.dwf.FDwfDeviceTriggerInfo(
+                    self.hdwf, byref(supported_triggers)
+                ),
+                "Reading supported hardware trigger sources",
+            )
+            if not supported_triggers.value & (1 << trigger_source.value):
+                return {
+                    "ready": False,
+                    "message": "The device does not support the selected wavegen trigger.",
+                }
 
         acquisition_duration = self.nSamples / self.frequencyAcquire
 
@@ -446,111 +486,142 @@ class DigilentApi():
             return {"ready": True, "message": f"Oscilloscope data aqcuired"}
 
         else:
-            buffer_size = c_int()
             self._require_dwf(
-                self.dwf.FDwfAnalogInBufferSizeGet(
-                    self.hdwf,
-                    byref(buffer_size),
+                self.dwf.FDwfAnalogInTriggerSourceSet(
+                    self.hdwf, trigger_source
                 ),
-                "Reading the configured analog input buffer size",
+                "Setting the record trigger source",
             )
-
-            buffer_duration = buffer_size.value / self.frequencyAcquire
-            polling_interval = buffer_duration 
+            self._require_dwf(
+                self.dwf.FDwfAnalogInTriggerAutoTimeoutSet(
+                    self.hdwf, c_double(0)
+                ),
+                "Disabling automatic record triggering",
+            )
+            # Record trigger positions are relative to the capture start, not its middle.
+            self._require_dwf(
+                self.dwf.FDwfAnalogInTriggerPositionSet(
+                    self.hdwf, c_double(0)
+                ),
+                "Setting the record trigger position",
+            )
 
             print("Start Recorder")
             self._require_dwf(
-                self.dwf.FDwfAnalogInConfigure(self.hdwf, 0, 1),
+                self.dwf.FDwfAnalogInConfigure(self.hdwf, c_int(1), c_int(1)),
                 "Starting record acquisition",
             )
-            if on_acquisition_started is not None:
-                on_acquisition_started()
+            try:
+                if trigger_output_channel is not None:
+                    while True:
+                        if time.monotonic() >= deadline:
+                            return {
+                                "ready": False,
+                                "message": "Oscilloscope timed out waiting to arm; no pulse was fired.",
+                            }
+                        self._require_dwf(
+                            self.dwf.FDwfAnalogInStatus(
+                                self.hdwf, c_int(0), byref(sts)
+                            ),
+                            "Waiting for the recorder to arm",
+                        )
+                        if sts.value == DwfStateArmed.value:
+                            break
+                        if sts.value in (DwfStateRunning.value, DwfStateDone.value):
+                            return {
+                                "ready": False,
+                                "message": "Recorder triggered before the pulse was fired.",
+                            }
+                    if time.monotonic() >= deadline:
+                        return {
+                            "ready": False,
+                            "message": "Oscilloscope timed out waiting to arm; no pulse was fired.",
+                        }
 
-            cSamples = 0
-            cAvailable = c_int()
-            cLost = c_int()
-            cCorrupted = c_int()
-            fLost = 0
-            fCorrupted = 0
+                if on_acquisition_started is not None:
+                    on_acquisition_started()
 
-            print(f"Polling interval: {polling_interval}")
-            while cSamples < self.nSamples:
-                if time.monotonic() >= deadline:
+                cSamples = 0
+                cAvailable = c_int()
+                cLost = c_int()
+                cCorrupted = c_int()
+
+                while cSamples < self.nSamples:
+                    if time.monotonic() >= deadline:
+                        return {
+                            "ready": False,
+                            "message": (
+                                "Oscilloscope record acquisition timed out: "
+                                f"received {cSamples} of {self.nSamples} samples per channel."
+                            ),
+                        }
                     self._require_dwf(
-                        self.dwf.FDwfAnalogInConfigure(
-                            self.hdwf, c_int(1), c_int(0)
+                        self.dwf.FDwfAnalogInStatus(
+                            self.hdwf, c_int(1), byref(sts)
                         ),
-                        "Stopping timed-out record acquisition",
+                        "Reading acquisition status",
                     )
-                    return {
-                        "ready": False,
-                        "message": "Oscilloscope record acquisition timed out.",
-                    }
-                remaining_time = deadline - time.monotonic()
-                # time.sleep(min(polling_interval, max(0.0, remaining_time)))
-                
+                    if sts.value in (
+                        DwfStateConfig.value,
+                        DwfStatePrefill.value,
+                        DwfStateArmed.value,
+                    ):
+                        continue
+                    self._require_dwf(
+                        self.dwf.FDwfAnalogInStatusRecord(
+                            self.hdwf, byref(cAvailable), byref(cLost), byref(cCorrupted)
+                        ),
+                        "Reading record status",
+                    )
+                    if cLost.value or cCorrupted.value:
+                        return {
+                            "ready": False,
+                            "message": (
+                                "Record acquisition failed: "
+                                f"{cLost.value} samples lost and "
+                                f"{cCorrupted.value} samples potentially corrupted. "
+                                "Reduce the sample rate or capture length."
+                            ),
+                        }
+
+                    count = min(cAvailable.value, self.nSamples - cSamples)
+                    if count:
+                        self._require_dwf(
+                            self.dwf.FDwfAnalogInStatusData(
+                                self.hdwf,
+                                self.analogMeasurementChannel,
+                                byref(self.measuredSamples, sizeof(c_double) * cSamples),
+                                c_int(count),
+                            ),
+                            "Reading recorded measured samples",
+                        )
+                        self._require_dwf(
+                            self.dwf.FDwfAnalogInStatusData(
+                                self.hdwf,
+                                self.analogReferenceChannel,
+                                byref(self.referenceSamples, sizeof(c_double) * cSamples),
+                                c_int(count),
+                            ),
+                            "Reading recorded reference samples",
+                        )
+                        cSamples += count
+
+                    if sts.value == DwfStateDone.value and cSamples < self.nSamples:
+                        return {
+                            "ready": False,
+                            "message": (
+                                "Record acquisition ended early: "
+                                f"received {cSamples} of {self.nSamples} samples per channel. "
+                                "Reduce the sample rate or capture length."
+                            ),
+                        }
+
+                return {"ready": True, "message": "Oscilloscope data retrieved"}
+            finally:
                 self._require_dwf(
-                    self.dwf.FDwfAnalogInStatus(self.hdwf, 1, byref(sts)),
-                    "Reading acquisition status",
+                    self.dwf.FDwfAnalogInConfigure(self.hdwf, c_int(0), c_int(0)),
+                    "Stopping record acquisition",
                 )
-
-                if cSamples == 0 and (sts.value == DwfStateConfig.value or sts.value == DwfStatePrefill.value or sts.value == DwfStateArmed.value) :
-                    # Acquisition not yet started.
-                    print("Acquisition not yet started")
-                    continue
-                # check for lost samples or corrupt data
-                self._require_dwf(
-                    self.dwf.FDwfAnalogInStatusRecord(self.hdwf, byref(cAvailable), byref(cLost), byref(cCorrupted)),
-                    "Reading record status",
-                )
-                
-                cSamples += cLost.value
-                if cLost.value :
-                    fLost = 1
-                if cCorrupted.value :
-                    fCorrupted = 1
-                if cSamples >= self.nSamples:
-                    print("All samples acquired")
-                    break
-                if cAvailable.value==0 :
-                    continue
-                if cSamples+cAvailable.value > self.nSamples :
-                    cAvailable.value = self.nSamples-cSamples
-
-                self._require_dwf(
-                    self.dwf.FDwfAnalogInStatusData(
-                        self.hdwf,
-                        self.analogMeasurementChannel,
-                        byref(self.measuredSamples, sizeof(c_double)*cSamples),
-                        cAvailable,
-                    ),
-                    "Reading recorded samples",
-                )
-
-                self._require_dwf(
-                    self.dwf.FDwfAnalogInStatusData(
-                        self.hdwf,
-                        self.analogReferenceChannel,
-                        byref(self.referenceSamples, sizeof(c_double)*cSamples),
-                        cAvailable,
-                    ),
-                    "Reading recorded samples",
-                )
-
-                cSamples += cAvailable.value
-
-            warnings = []
-            if fLost:
-                warnings.append("samples were lost")
-            if fCorrupted:
-                warnings.append("samples may be corrupted")
-
-            message = "Oscilloscope data retrieved"
-            if warnings:
-                message += "; " + " and ".join(warnings)
-
-
-            return {"ready": True, "message": f"{message}"}
 
     def prepare_wave(
         self,

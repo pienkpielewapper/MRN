@@ -1,0 +1,158 @@
+RECORD-MODE ACQUISITION: FINDINGS AND RECOMMENDATIONS
+=====================================================
+Date:    2026-11-13
+Device:  Analog Discovery 3, WaveForms SDK (DWF) 3.25.1
+Code:    digilent/api.py (configure_oscilloscope, read_oscilloscope)
+
+All measurements below were made on this PC with the analog inputs only.
+The wavegen output was never driven during testing.
+
+
+1. THE PROBLEM
+--------------
+In "record" mode, 40,000 samples were acquired but 45,000 or more left the
+app printing "No samples available" until the timeout. No "Lost samples"
+message appeared.
+
+
+2. CAUSE
+--------
+The device buffer overflows and the SDK does not report it.
+
+  a. Record mode streams samples to the PC over USB while the device keeps
+     sampling. With both channels enabled this PC reads about 6 to 9 MS/s.
+  b. Above that sample rate a backlog builds up in the device for the whole
+     length of the record.
+  c. The device buffer holds 16,384 samples per channel. When the backlog
+     exceeds that, the oldest samples are overwritten.
+  d. FDwfAnalogInStatusRecord reports lost = 0 for this overwrite, so exactly
+     16,384 samples disappear without any message.
+  e. The record finishes 16,384 samples short of the requested count, so the
+     loop in read_oscilloscope waits for samples that will never arrive.
+
+Because the backlog grows with record length, there is a sample count above
+which the buffer wraps. At 10 MS/s that count is roughly 43,000, which matches
+the 40,000 / 45,000 behaviour. The sample rate used in the app was not
+confirmed, so 10 MS/s is an inference.
+
+Every stuck run in testing was short by exactly 16,384 samples with lost = 0.
+
+
+3. WHAT WAS MEASURED
+--------------------
+Largest capture that completed with no corruption flag (3 runs each; sizes
+tested were 20k, 30k, 40k, 60k, 80k, 120k, 200k and 400k samples):
+
+  Channels  Rate      Buffer 16,384 (current)   Buffer 32,768
+  --------  --------  ------------------------  -------------
+  2         10 MS/s   flagged even at 20k       40k
+  2         20 MS/s   20k                       30k
+  1         10 MS/s   400k+                     400k+
+  1         20 MS/s   30k                       80k
+
+Other observations:
+
+  - About 97% of the record loop's time is spent inside FDwfAnalogInStatus,
+    which is the USB transfer. Copying samples out takes about 3%. Changing
+    the Python loop will not raise the limit.
+  - At 10 MS/s with two channels, the runs that completed were flagged by the
+    SDK as possibly corrupted. The 40,000-sample data taken at that rate
+    should be treated as suspect.
+  - A delay between starting the record and the first status read causes the
+    same silent loss once it exceeds 16,384 / sample rate (1.6 ms at 10 MS/s).
+    The pulse callback (generate_wave) runs in exactly that gap. Its duration
+    was not measured.
+  - The AD3 has a device configuration with a 32,768-sample scope buffer
+    (FDwfDeviceConfigOpen with configuration index 1). The code currently
+    opens the default configuration.
+  - The scope's maximum sample rate is 100 MS/s.
+
+
+4. CONCLUSION ON 20 MS/s
+------------------------
+Streaming two channels at 20 MS/s is not achievable on this device. The limit
+is the USB link, not the software.
+
+Captures into the device buffer ("read" mode) are not affected by USB speed.
+With a hardware trigger, several buffered captures can be joined into one
+long trace:
+
+  - Trigger the scope from the wavegen (trigsrcAnalogOut1), so every capture
+    starts on the pulse.
+  - Capture 32,768 samples per channel per shot (1.64 ms at 20 MS/s).
+  - Fire the pulse again with the capture window delayed by one window
+    length each time, and join the segments.
+
+Tested with a software trigger in place of the wavegen, at 20 and 100 MS/s:
+the device applied the requested window position exactly (0 ns error) for
+segments 0, 1, 2, 5 and 40 and returned a full buffer in 25 of 25 captures
+each. Each segment took about 5 ms plus its delay.
+
+The stitched trace has no missing time ranges, because each segment comes
+from its own pulse and is read out fully before the next one is fired. The
+cost is that the trace is built from several pulses, not one.
+
+
+5. NOT YET VERIFIED
+-------------------
+  - Triggering the scope from the wavegen on this device.
+  - Whether the wavegen trigger lands on the same point within a sample
+    period on every shot. At 20 MS/s the possible offset between segments is
+    up to one sample (50 ns). At 100 MS/s it cannot occur.
+  - Whether the signal is repeatable from pulse to pulse, and how long echoes
+    take to die out between shots.
+
+Checking these requires firing the pulse through the wavegen output.
+
+
+6. RECOMMENDATIONS
+------------------
+  1. Make the record loop fail fast. If the state is Done and no samples are
+     available, return an error stating how many samples arrived instead of
+     waiting for the timeout.
+
+  2. Keep record mode for rates of about 2 MS/s and below with two channels.
+     5 MS/s completed every run but raised one corruption flag.
+
+  3. Open the device with the 32,768-sample configuration. It doubles the
+     buffer for both modes.
+
+  4. Use hardware triggering in "read" mode: arm the scope, wait for the
+     Armed state, then fire the pulse. This also removes the USB timing
+     jitter between the pulse and the start of the capture, which matters
+     for time-of-flight.
+
+  5. For captures longer than one buffer at 20 MS/s or above, add a stitched
+     mode as described in section 4. Overlap adjacent segments by a few
+     hundred samples and compare the overlap, so a misaligned or
+     non-repeatable acquisition is detected instead of silently accepted.
+
+  6. If a long single-shot capture of both channels at 20 MS/s is required
+     (a signal that cannot be repeated), the AD3 cannot provide it. That
+     needs a scope with a deeper on-device buffer.
+
+7. IMPLEMENTED HARDWARE-TRIGGERED RECORDING
+-------------------------------------------
+The app's Record mode now uses the selected waveform-generator channel as
+the scope's internal hardware trigger. It prepares the waveform, disables
+automatic triggering, sets the record trigger position to the capture start,
+starts the scope, waits for Armed, and fires exactly one pulse. No external
+trigger cable is needed. The timeout covers arming and recording.
+
+The recorder drains the final data when Done is reported and immediately
+rejects an incomplete capture instead of waiting for the timeout. Lost or
+potentially corrupted samples also fail the acquisition; they are not plotted
+as a successful measurement. The recorder is stopped after completion,
+failure, timeout, or a pulse-callback exception.
+
+The API's optional trigger_output_channel argument enables this behavior;
+it requires record mode and an on_acquisition_started pulse callback. Without
+that argument, recording remains untriggered. Buffered Read mode is unchanged.
+
+These changes do not increase USB throughput or select a larger device
+configuration. The 32,768-sample configuration remains a separate recommendation.
+Repeated-pulse stitching is not suitable for the required single-pulse capture.
+
+Validation uses simulated SDK status/data responses. Actual wavegen trigger
+timing and maximum reliable single-pulse capture length still require hardware
+verification; the earlier measurements do not certify the new sequence.

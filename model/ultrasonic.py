@@ -205,6 +205,7 @@ def review_ultrasonic_signals(
     min_cutoff_frequency: float = 0.0,
     ref_db_gain:float=0.0,
     measured_db_gain:float=0.0,
+    apply_gain: bool = False,
     
 ) -> tuple[float, float, tuple[float, float], tuple[float, float], np.ndarray, np.ndarray, np.ndarray, float, float]:
     """
@@ -218,6 +219,7 @@ def review_ultrasonic_signals(
     - cutoff_expander: shfts the frequency domain cutoff idxs (min-expander),(max+expander)
     - db Gain reference: gain applied to signal in dB
     - db Gain measured: gain applied to signal in dB
+    - apply_gain: include gain-adjusted signals in attenuation calculation
     - density of specimen in kg/m3
 
 
@@ -258,10 +260,10 @@ def review_ultrasonic_signals(
 
     measured_dist=np.argmax(measured)-measured_start
 
-    # Slice everything to start at ref start
-    time=time[ref_start:]
-    reference=reference[ref_start:]
-    measured=measured[ref_start:]
+    # # Slice everything to start at ref start
+    # time=time[ref_start:]
+    # reference=reference[ref_start:]
+    # measured=measured[ref_start:]
 
     # Reset start idxs, start with measured before resetting ref to 0, everything shifts left on time axis
     measured_start=measured_start-ref_start
@@ -277,30 +279,38 @@ def review_ultrasonic_signals(
         time, reference, cutoff_percentage, frequency_cutoff_expander, min_cutoff_frequency
     )
 
-    ref_gain_factor= get_gain_factor('out',ref_db_gain)
-    measured_gain_factor= get_gain_factor('out',measured_db_gain)
-    reference = reference * ref_gain_factor
-    measured = measured * measured_gain_factor
-
     SNR_before=SNR(measured,start=measured_start,end=int(measured_end))
 
     filtered_reference = band_pass_filter(reference, minimum_frequency, max_frequency, spacing)
     filtered_measured = band_pass_filter(measured, minimum_frequency, max_frequency, spacing)
 
     SNR_after=SNR(filtered_measured,start=measured_start,end=int(measured_end))
+
+    ref_gain_factor = get_gain_factor("out", ref_db_gain)
+    measured_gain_factor = get_gain_factor("out", measured_db_gain)
+    gained_reference = filtered_reference * ref_gain_factor
+    gained_measured = filtered_measured * measured_gain_factor
+
+    attenuation_reference = gained_reference if apply_gain else filtered_reference
+    attenuation_measured = gained_measured if apply_gain else filtered_measured
     
     tof, attenuation = get_ultrasonic_characteristics(
-        time, filtered_reference, filtered_measured, minimum_frequency, max_frequency, spacing
+        time,
+        attenuation_reference,
+        attenuation_measured,
+        minimum_frequency,
+        max_frequency,
+        spacing,
     )
 
-    ref_peak_idx=np.argmax(filtered_reference)
-    measured_peak_idx=np.argmax(filtered_measured)
+    ref_peak_idx=np.argmax(gained_reference)
+    measured_peak_idx=np.argmax(gained_measured)
 
     # Get Peak Coords
-    ref_peak_coord=tuple([time[ref_peak_idx],filtered_reference[ref_peak_idx]])
-    measured_peak_coord=tuple([time[measured_peak_idx],filtered_measured[measured_peak_idx]])
+    ref_peak_coord=tuple([time[ref_peak_idx],gained_reference[ref_peak_idx]])
+    measured_peak_coord=tuple([time[measured_peak_idx],gained_measured[measured_peak_idx]])
 
     if tof == 0:
         raise ValueError("Time of Flight measured as 0, this will result in zero division, ensure refernce and measured wave are not the same")
     
-    return float(tof), float(attenuation), ref_peak_coord, measured_peak_coord, time, filtered_reference, filtered_measured, SNR_before, SNR_after
+    return float(tof), float(attenuation), ref_peak_coord, measured_peak_coord, time, gained_reference, gained_measured, SNR_before, SNR_after
